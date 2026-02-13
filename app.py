@@ -38,6 +38,12 @@ ALL_VOICE_IDS = sorted([
     'pf_dora', 'pm_alex', 'pm_santa',
 ])
 
+# Import for VibeVoice
+try:
+    from transformers import VitsModel, AutoTokenizer
+    import scipy.io.wavfile
+except ImportError:
+    pass  # We'll handle this later if needed
 
 try:
     from kokoro import KPipeline
@@ -70,6 +76,30 @@ def load_kokoro_pipeline():
         st.warning("Ensure 'espeak-ng' is correctly installed and accessible.")
         st.exception(e)
         return None
+
+@st.cache_resource
+def load_vibe_voice_pipeline():
+    """Loads the VibeVoice pipeline. Cached by Streamlit."""
+    try:
+        import warnings
+        warnings.filterwarnings("ignore", category=FutureWarning)
+
+        # Show a message that the model is being loaded
+        st.info("Loading VibeVoice Realtime model. This may take a few minutes on first run as the model downloads...")
+
+        # Load the Microsoft VibeVoice Realtime model (smaller and faster)
+        model = VitsModel.from_pretrained("microsoft/VibeVoice-Realtime-0.5B",
+                                         cache_dir="./model_cache",
+                                         resume_download=True)
+        tokenizer = AutoTokenizer.from_pretrained("microsoft/VibeVoice-Realtime-0.5B",
+                                                 cache_dir="./model_cache")
+        st.success("VibeVoice Realtime model loaded successfully!")
+        return model, tokenizer
+    except Exception as e:
+        # Catch potential errors during pipeline initialization
+        st.error(f"Failed to load VibeVoice pipeline: {e}")
+        st.exception(e)
+        return None, None
 
 def generate_speech_kokoro(text, pipeline, voice):
     """
@@ -132,11 +162,53 @@ def generate_speech_kokoro(text, pipeline, voice):
         return None, None
 
 
+def generate_speech_vibe_voice(text, model, tokenizer):
+    """
+    Generates speech using the Microsoft VibeVoice model.
+
+    Args:
+        text (str): Text to synthesize.
+        model: The loaded VibeVoice model.
+        tokenizer: The loaded tokenizer for VibeVoice.
+
+    Returns:
+        tuple(np.ndarray, int): Tuple of (audio_waveform, sampling_rate) or (None, None) on error.
+    """
+    if not text:
+        st.warning("Please enter some text.")
+        return None, None
+    if model is None or tokenizer is None:
+         st.error("VibeVoice model or tokenizer is not loaded. Cannot generate speech.")
+         return None, None
+
+    try:
+        st.info("Generating audio with VibeVoice...")
+        
+        # Tokenize the input text
+        inputs = tokenizer(text, return_tensors="pt")
+        
+        # Generate audio
+        with torch.no_grad():
+            output = model(**inputs).waveform
+            
+        # Convert to numpy array
+        audio_waveform = output.squeeze().cpu().numpy()
+        sampling_rate = model.config.sampling_rate  # Usually 16000 or 22050
+
+        return audio_waveform, sampling_rate
+
+    except Exception as e:
+        # Catch any errors during generation
+        st.error(f"An error occurred during VibeVoice audio generation: {e}")
+        st.exception(e)
+        return None, None
+
+
 def main():
-    st.title("🗣️ Kokoro TTS - Text to Speech")
+    st.title("🗣️ Kokoro & VibeVoice TTS - Text to Speech")
     # --- Updated Dependency Notice ---
     st.markdown("""
-    Uses [hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M).
+    Uses [hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) and [Microsoft/VibeVoice-Realtime-0.5B](https://huggingface.co/microsoft/VibeVoice-Realtime-0.5B).
     **Requires system dependencies:**
     * `espeak-ng` (for Kokoro text processing)
     * `ffmpeg` (for MP3 conversion - required for MP3 download)
@@ -145,24 +217,40 @@ def main():
     """)
     # --- End Updated Dependency Notice ---
 
-    pipeline = load_kokoro_pipeline()
-    if pipeline is None:
-         st.error("Application cannot start because the Kokoro pipeline failed to load...")
-         st.stop()
+    # Model selection
+    model_choice = st.sidebar.radio("Select TTS Model:", ("Kokoro", "VibeVoice"))
+    
+    if model_choice == "Kokoro":
+        pipeline = load_kokoro_pipeline()
+        if pipeline is None:
+            st.error("Application cannot start because the Kokoro pipeline failed to load...")
+            st.stop()
+    else:  # VibeVoice
+        model, tokenizer = load_vibe_voice_pipeline()
+        if model is None or tokenizer is None:
+            st.error("Application cannot start because the VibeVoice pipeline failed to load...")
+            st.stop()
 
     # --- Sidebar (Keep Selectbox as before) ---
     st.sidebar.header("Configuration")
-    default_voice = "af_bella"
-    try:
-        default_index = ALL_VOICE_IDS.index(default_voice)
-    except ValueError:
-        default_index = 0
-    selected_voice = st.sidebar.selectbox(
-        "Select Voice:",
-        options=ALL_VOICE_IDS,
-        index=default_index,
-        help="Choose a voice from the available options."
-    )
+    
+    if model_choice == "Kokoro":
+        default_voice = "af_bella"
+        try:
+            default_index = ALL_VOICE_IDS.index(default_voice)
+        except ValueError:
+            default_index = 0
+        selected_voice = st.sidebar.selectbox(
+            "Select Voice:",
+            options=ALL_VOICE_IDS,
+            index=default_index,
+            help="Choose a voice from the available options."
+        )
+    else:
+        # For VibeVoice, we don't have specific voice options, so we'll just show a message
+        st.sidebar.info("VibeVoice uses a single unified model for all voices.")
+        selected_voice = "vibe_voice_default"  # Placeholder
+
     # --- End Sidebar ---
 
     # --- Main Area ---
@@ -179,11 +267,18 @@ def main():
     if generate_button and text_input:
         with progress_container:
             with st.spinner('Synthesizing audio...'):
-                audio_waveform, sampling_rate = generate_speech_kokoro(
-                    text_input,
-                    pipeline,
-                    selected_voice
-                )
+                if model_choice == "Kokoro":
+                    audio_waveform, sampling_rate = generate_speech_kokoro(
+                        text_input,
+                        pipeline,
+                        selected_voice
+                    )
+                else:  # VibeVoice
+                    audio_waveform, sampling_rate = generate_speech_vibe_voice(
+                        text_input,
+                        model,
+                        tokenizer
+                    )
 
                 # --- Process and Display Audio ---
                 if audio_waveform is not None and sampling_rate is not None:
@@ -208,7 +303,7 @@ def main():
                                 st.download_button(
                                     label="Download WAV",
                                     data=wav_bytes_io, # Pass the BytesIO object directly
-                                    file_name=f"kokoro_{selected_voice}.wav",
+                                    file_name=f"{model_choice.lower()}_{selected_voice}.wav",
                                     mime="audio/wav"
                                 )
 
@@ -231,7 +326,7 @@ def main():
                                         st.download_button(
                                             label="Download MP3",
                                             data=mp3_bytes_io, # Pass the MP3 BytesIO object
-                                            file_name=f"kokoro_{selected_voice}.mp3",
+                                            file_name=f"{model_choice.lower()}_{selected_voice}.mp3",
                                             mime="audio/mpeg" # Correct MIME type for MP3
                                         )
                                     except Exception as e:
@@ -245,7 +340,7 @@ def main():
                              st.error(f"Error processing or displaying audio: {e}")
                              st.exception(e)
                 else:
-                    # If generation failed, message is shown in generate_speech_kokoro
+                    # If generation failed, message is shown in generate_speech_kokoro or generate_speech_vibe_voice
                     pass
                 # --- End Process and Display Audio ---
 
